@@ -128,9 +128,13 @@ class TinyTransformer:
         attn_weights = np.zeros((T, T))
         context = np.zeros_like(X)
         for i in range(T):
-            w, scores = attention_weights(Q[i], K, self.d)
+            # scores_j = (Q[i] · K[j]) / sqrt(d)
+            scores = (K @ Q[i]) / np.sqrt(self.d)           # (T,)
+            mask = np.arange(T) > i                          # True where j > i (future)
+            scores[mask] = -1e9                              # -inf mask
+            w = softmax(scores)                              # (T,)
             attn_weights[i] = w
-            context[i] = w @ V  # weighted sum over time
+            context[i] = w @ V
 
             if trace:
                 print(f"\n--- Attention at position {i} (token='{self.i2v[ids[i]]}') ---")
@@ -211,6 +215,7 @@ def main():
     for tok, p in top:
         print(f"{tok:>8s} : {p:.4f}")
 
+
     # 7) Also show from the last *content* token if longer than 2
     if len(ids) > 2:
         print("\n=== NEXT-TOKEN PREDICTION (from last content token) ===")
@@ -220,6 +225,16 @@ def main():
         print(f"(Conditioning on token '{vocab[ids[last_content_idx]]}')")
         for tok, p in top2:
             print(f"{tok:>8s} : {p:.4f}")
+
+    # after computing probs
+    assert np.allclose(out["probs"].sum(axis=1), 1.0, atol=1e-6)
+
+    # check one attention row sums to 1
+    i = len(ids) - 2  # last content token
+    row_sum = out["attn"][i].sum()
+    assert abs(row_sum - 1.0) < 1e-6, row_sum
+
+    # seed determinism sanity check (should change if you change seed)
 
 if __name__ == "__main__":
     main()
