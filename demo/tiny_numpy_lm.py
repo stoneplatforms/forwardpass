@@ -73,6 +73,26 @@ class TinyNumPyLM:
         self.W2  = rng.normal(0, 0.2, size=(d_ff,d)).astype(np.float32)
         self.b2  = np.zeros((d,), dtype=np.float32)
 
+        # Photographic Memory Attention (PMA) components (kept fixed for simplicity)
+        self.mem_size = 512
+        self.MK = np.zeros((self.mem_size, self.d), dtype=np.float32)
+        self.MV = np.zeros((self.mem_size, self.d), dtype=np.float32)
+        self.mem_ptr = 0
+        self.W_m  = rng.normal(0, 0.2, size=(self.d, self.d)).astype(np.float32)
+        self.W_g  = rng.normal(0, 0.2, size=(2*self.d, 1)).astype(np.float32)
+        self.alpha = 0.5
+        self.use_gate = False
+
+    def mem_write(self, H):
+        # Mean-pool sequence to a single slot and write projected K/V
+        s = H.mean(axis=0, keepdims=True)
+        k = (s @ self.W_K).astype(np.float32)
+        v = (s @ self.W_V).astype(np.float32)
+        i = self.mem_ptr % self.mem_size
+        self.MK[i] = k
+        self.MV[i] = v
+        self.mem_ptr += 1
+
     def forward(self, ids, trace=False):
         T = len(ids)
         X_tok = self.E[ids]                  # (T,d)
@@ -82,12 +102,27 @@ class TinyNumPyLM:
         K = X @ self.W_K                     # (T,d)
         Vv = X @ self.W_V                    # (T,d)
 
+        # --- Memory read (PMA) ---
+        valid_m = min(self.mem_ptr, self.mem_size)
+        if valid_m > 0:
+            MK = self.MK[:valid_m]
+            MV = self.MV[:valid_m]
+            mem_scores = (Q @ MK.T) / math.sqrt(self.d)   # (T, valid_m)
+            mem_w = softmax(mem_scores, axis=1)           # (T, valid_m)
+            R = mem_w @ MV                                 # (T, d)
+        else:
+            R = np.zeros_like(Q)
+        Mtilde = R @ self.W_m                               # (T, d)
+
         # causal attention
         context = np.zeros_like(X)
         attn = np.zeros((T,T), dtype=np.float32)
         scale = 1.0 / math.sqrt(self.d)
         for i in range(T):
             scores = (K @ Q[i]) * scale      # (T,)
+            # add memory-derived bias
+            bias_i = (K @ Mtilde[i]) * self.alpha
+            scores += bias_i
             # mask future
             scores[i+1:] = -1e9
             w = softmax(scores, axis=0)
@@ -96,14 +131,26 @@ class TinyNumPyLM:
 
         H_attn = context @ self.W_O          # (T,d)
         H_ff = relu(H_attn @ self.W1 + self.b1) @ self.W2 + self.b2
-        H = X + H_attn + H_ff                # (T,d)
+        # Optional gating between local path and memory read
+        if self.use_gate:
+            QR = np.concatenate([Q, R], axis=1)            # (T, 2d)
+            gamma = 1.0 / (1.0 + np.exp(-(QR @ self.W_g).squeeze(-1)))
+            gamma = gamma[:, None]
+            H_local = X + H_attn + H_ff
+            H = (1.0 - gamma) * H_local + gamma * R
+        else:
+            H = X + H_attn + H_ff                # (T,d)
 
         logits = H @ self.W_vocab + self.b_vocab   # (T,V)
         probs  = softmax(logits, axis=-1)          # (T,V)
-        return {
+        out = {
             "X_tok":X_tok, "X":X, "Q":Q, "K":K, "V":Vv, "attn":attn,
-            "H_attn":H_attn, "H_ff":H_ff, "H":H, "logits":logits, "probs":probs
+            "H_attn":H_attn, "H_ff":H_ff, "H":H, "logits":logits, "probs":probs,
+            "R":R
         }
+        # Write to memory after forward
+        self.mem_write(H)
+        return out
 
     def loss_and_grads(self, ids):
         """
